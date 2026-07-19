@@ -1,51 +1,75 @@
-# implement-issues — unattended implementation workflow for Claude Code
+# implement-issues — unattended DAG-parallel implementation workflow for Claude Code
 
 A **reusable Claude Code workflow** that works through a whole backlog of issues without
-babysitting. It discovers agent-ready tickets, respects their blocking edges, and builds each
-one in a **fresh context** via TDD + a two-axis code review — then commits and closes it — and
-loops until the frontier is dry.
+babysitting. It builds the ticket **dependency DAG**, auto-reviews the plan, then implements each
+**topological layer in parallel** (isolated git worktrees) behind **hard test gates** — landing
+everything on an integration branch with a draft PR for you to review. It never touches your
+base branch.
 
-It is a *development framework*, not tied to any specific issue or repo. It adapts to your
-project by reading your tracker convention at runtime.
+It is a *development framework*, not tied to any specific issue, and it makes **zero changes to
+your skills** — it works on top of the artifacts that `/to-spec` and `/to-tickets` produce.
 
-## What it does, each round
+## Pipeline
 
-1. **Scan** — a read-only agent reads your `docs/agents/issue-tracker.md`, lists open issues
-   labelled `ready-for-agent`, queries each one's GitHub native `blocked_by` dependencies, and
-   picks the single lowest-numbered ticket whose blockers are **all closed** (blockers-first).
-2. **Implement** — a fresh-context agent owns that one ticket end-to-end, following the
-   `/implement` discipline:
-   - claim it (`--add-assignee @me`), read the spec + thread,
-   - build **test-first** (red → green, slice by slice),
-   - run the full suite,
-   - **code-review the diff on two axes** — *Standards* (your repo's coding standards) and
-     *Spec* (does the diff deliver what the issue asked?),
-   - commit referencing the issue, post a resolution comment, close it.
-3. **Loop** — re-scan (a just-closed ticket may unblock downstream work) until nothing is
-   eligible.
+1. **Preflight** — reads your tracker convention, runs a **baseline test gate** on the current
+   branch (aborts if red — never build on a broken baseline), and cuts a fresh integration
+   branch `auto/implement`.
+2. **Plan** — lists open `ready-for-agent` issues and **selects only leaf tickets**. Both
+   `/to-spec` specs and `/to-tickets` tickets carry the same label, so the label alone is not
+   enough: an umbrella/spec is a *parent* issue (`sub_issues_summary.total > 0`), a buildable
+   ticket is a *leaf* (`total == 0`). Specs are excluded. Blockers (`blocked_by`) become DAG
+   edges, and the DAG is sliced into **topological layers** — each layer is a set of mutually
+   independent tickets safe to build in parallel.
+3. **Review** — a plan reviewer with **abort power** vets the DAG. Structural problems (cycles,
+   a spec that slipped in, mis-layering) it fixes automatically; a **major directional doubt**
+   aborts the run rather than bulk-writing wrong code.
+4. **Execute** — for each layer, in order:
+   - **parallel build**: one agent per ticket in its **own git worktree**, running the
+     `/implement` discipline (claim → TDD red-green → per-ticket test gate → two-axis code
+     review) and committing to a ticket branch. Nothing merges yet.
+   - **serial integration**: merge each ticket branch into the integration branch and re-run the
+     **full suite** (post-merge gate). A git **or semantic** conflict (clean merge, red tests) →
+     the ticket is **rebuilt against the updated tip** and re-integrated (optimistic parallelism
+     with serial fallback), up to `retries` times.
+   - **layer barrier**: full suite must be green before the next layer starts.
+   - Any unresolved failure **halts the layer** and leaves the issue open for a human.
+5. **Finalize** — push the integration branch and open a **draft PR** into your base branch.
+   **Never auto-merges** — you own the final gate.
+
+## Design decisions
+
+- **Fully unattended** — no human gate mid-run; the plan reviewer is the safeguard, the draft PR
+  is the after-the-fact review surface.
+- **Robustness over speed/cost** — worktree isolation (each may install its own deps), a full
+  test run at every gate, and conflict-driven rebuilds. It deliberately spends more to stay
+  correct.
+- **Test gate is absolute** — nothing advances on a red suite: baseline, per-ticket, post-merge,
+  and layer barrier.
+- **Spec vs ticket by structure, not labels** — so it needs no new labelling discipline and no
+  changes to the Matt-Pocock skills.
 
 ## Safety
 
-- Never fakes a green suite or a passing review. If it gets genuinely stuck, it sets the ticket
-  `failed`, **leaves the issue open**, and explains why for a human.
-- Halts after **2 consecutive failures** for human review.
-- Winds down when the token budget runs low.
-- Never retries a ticket it already attempted this run (no infinite loops).
-- `dryRun` mode plans and builds but never commits or closes.
+- Never fakes a green suite or a passing review; a stuck ticket is left **open** with an
+  explanation, and its layer halts.
+- Aborts before writing any code if the **baseline is red** or the **plan reviewer** has a major
+  doubt.
+- **Subagents write to your tracker** (assign, comment, close issues; push a branch; open a PR).
+  Only run it against a repo where that is acceptable — launching the workflow is your
+  authorization for those writes.
 
 ## Prerequisites
 
 - **Claude Code** with the Workflow capability.
 - **`gh` CLI**, authenticated (`gh auth login`), with `repo` scope.
 - Your repo follows the **Matt-Pocock issue-tracker convention**:
-  - a `docs/agents/issue-tracker.md` describing your tracker ops (see
-    [`docs/issue-tracker.example.md`](docs/issue-tracker.example.md)),
-  - implementation-ready issues carry the **`ready-for-agent`** label,
-  - dependencies are expressed as **GitHub native issue dependencies** (`blocked_by`).
+  - a `docs/agents/issue-tracker.md` (see [`docs/issue-tracker.example.md`](docs/issue-tracker.example.md)),
+  - implementation-ready tickets carry the **`ready-for-agent`** label,
+  - dependencies use **GitHub native issue dependencies** (`blocked_by`),
+  - specs are **parent issues** with their tickets attached as **sub-issues**.
+- A project with a runnable test command (the agents detect it).
 
 ## Install
-
-Drop the script into your Claude Code workflows directory:
 
 ```bash
 # global (all projects)
@@ -57,34 +81,30 @@ mkdir -p .claude/workflows && cp workflows/implement-issues.js .claude/workflows
 
 ## Use
 
-From Claude Code, ask it to run the workflow, or invoke directly:
-
 ```js
 Workflow({
   scriptPath: "~/.claude/workflows/implement-issues.js",
   args: {
-    repo: "owner/name",   // optional — inferred from git origin if omitted
+    repo: "owner/name",       // optional — inferred from git origin if omitted
     label: "ready-for-agent", // optional — the "buildable" label
-    max: 5,               // optional — cap tickets built this run
-    dryRun: false         // optional — true = plan/build but don't commit or close
+    retries: 1,               // optional — conflict rebuilds per ticket
+    push: true                // optional — false = keep integration branch local, no PR
   }
 })
 ```
 
-**Recommendation:** run with `dryRun: true` first to see which tickets it would pick and in
-what order, then run for real.
-
 ## Returns
 
 ```js
-{ built, succeeded: [numbers], failed: [{number, summary}], results: [...] }
+{ integrationBranch, baseBranch, completed: [numbers], failed: [{number, summary}],
+  halted: boolean, pr: url|null, pushed: boolean }
 ```
 
 ## Notes
 
-- Tune `max` and mind the token budget — real tickets are heavier than toy ones.
-- The workflow is deliberately **sequential** (one ticket at a time) to keep shared-file edits
-  conflict-free and each build in a clean context.
+- Mind the token budget — worktree-parallel builds with full test runs at every gate are
+  heavier than a naive sequential loop. The workflow winds down when the budget runs low.
+- Concurrency is capped automatically by the workflow engine (~min(16, cores-2)).
 
 ---
 
