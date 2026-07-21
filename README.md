@@ -1,59 +1,69 @@
-# implement-issues — unattended DAG-parallel implementation workflow for Claude Code
+# implement-issues — unattended dynamic-replan implementation workflow for Claude Code
 
 A **reusable Claude Code workflow** that works through a whole backlog of issues without
-babysitting. It builds the ticket **dependency DAG**, auto-reviews the plan, then implements each
-**topological layer in parallel** (isolated git worktrees) behind **hard test gates** — landing
-everything on an integration branch with a draft PR for you to review. It never touches your
-base branch.
+babysitting. Instead of committing to one big up-front dependency graph, it runs a **dynamic
+re-plan loop**: every round it releases only the issues that are safe to build **right now**,
+builds them in parallel (isolated git worktrees, TDD), reviews them, then serially merges each
+behind a **hard full-suite gate** — landing everything on an integration branch with a draft PR
+for you to review. It never touches your base branch.
 
 It is a *development framework*, not tied to any specific issue, and it makes **zero changes to
-your skills** — it works on top of the artifacts that `/to-spec` and `/to-tickets` produce.
+your skills** — it works on top of the artifacts that `/to-spec` and `/to-tickets` produce, and
+delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-merge-conflicts`).
 
 ## Pipeline
 
 1. **Preflight** — reads your tracker convention, runs a **baseline test gate** on the current
    branch (aborts if red — never build on a broken baseline), and cuts a fresh integration
    branch `auto/implement`.
-2. **Plan** — lists open `ready-for-agent` issues and **selects only leaf tickets**. Both
-   `/to-spec` specs and `/to-tickets` tickets carry the same label, so the label alone is not
-   enough: an umbrella/spec is a *parent* issue (`sub_issues_summary.total > 0`), a buildable
-   ticket is a *leaf* (`total == 0`). Specs are excluded. Blockers (`blocked_by`) become DAG
-   edges, and the DAG is sliced into **topological layers** — each layer is a set of mutually
-   independent tickets safe to build in parallel.
-3. **Review** — a plan reviewer with **abort power** vets the DAG. Structural problems (cycles,
-   a spec that slipped in, mis-layering) it fixes automatically; a **major directional doubt**
-   aborts the run rather than bulk-writing wrong code.
-4. **Execute** — for each layer, in order:
-   - **parallel build**: one agent per ticket in its **own git worktree**, running the
-     `/implement` discipline (claim → TDD red-green → per-ticket test gate → two-axis code
-     review) and committing to a ticket branch. Nothing merges yet.
-   - **serial integration**: merge each ticket branch into the integration branch and re-run the
-     **full suite** (post-merge gate). A git **or semantic** conflict (clean merge, red tests) →
-     the ticket is **rebuilt against the updated tip** and re-integrated (optimistic parallelism
-     with serial fallback), up to `retries` times.
-   - **layer barrier**: full suite must be green before the next layer starts.
-   - Any unresolved failure **halts the layer** and leaves the issue open for a human.
-5. **Finalize** — push the integration branch and open a **draft PR** into your base branch.
-   **Never auto-merges** — you own the final gate.
+2. **Re-plan loop** — each round (up to `maxRounds`, while budget allows):
+   - **Plan** — lists open `ready-for-agent` issues and **selects only leaf tickets**. Both
+     `/to-spec` specs and `/to-tickets` tickets carry the same label, so the label alone is not
+     enough: an umbrella/spec is a *parent* issue (`sub_issues_summary.total > 0`), a buildable
+     ticket is a *leaf* (`total == 0`). Specs are excluded. The planner then releases **only the
+     currently-unblocked batch**, treating three things as blocking edges it re-judges live:
+     **logical** deps (`blocked_by`), **file overlap** (two issues likely editing the same files
+     are *serialized* across rounds instead of colliding at merge), and **API shape** (a consumer
+     waits for its producer). It never commits to a full DAG — a planning mistake only affects one
+     round, and the next re-plan self-corrects. An **empty batch ends the run.**
+   - **Build (parallel)** — one agent per released issue in its **own git worktree** on a
+     deterministic branch `wf/issue-{n}` (reused and accumulated across rounds, never rebuilt):
+     claim → `/tdd` red-green → per-ticket full-suite gate → commit. Then, **only if commits
+     landed**, a separate reviewer agent runs `/code-review` (Standards + Spec) and commits fixes.
+   - **Merge (serial)** — merge each built branch into the integration branch one at a time; a
+     conflict is **resolved in place** via `/resolving-merge-conflicts` (read both sides, never
+     rebuild). The **full suite runs after every merge** — this per-merge gate *is* the barrier.
+     Green + clean → the issue is **closed**. Red → that one merge is **rolled back** and the issue
+     returns to a later round.
+   - **Set-aside** — an issue that fails (build or merge) twice (**k=2**) is parked: excluded from
+     later rounds, left **open** for the PR, its branch progress preserved.
+3. **Finalize** — push the integration branch and open a **draft PR** into your base branch,
+   summarising what landed and listing every set-aside / unfinished issue. **Never auto-merges**
+   — you own the final gate.
 
 ## Design decisions
 
-- **Fully unattended** — no human gate mid-run; the plan reviewer is the safeguard, the draft PR
-  is the after-the-fact review surface.
-- **Robustness over speed/cost** — worktree isolation (each may install its own deps), a full
-  test run at every gate, and conflict-driven rebuilds. It deliberately spends more to stay
-  correct.
-- **Test gate is absolute** — nothing advances on a red suite: baseline, per-ticket, post-merge,
-  and layer barrier.
+- **Dynamic re-plan over a static DAG** — the planner answers one small, local question each round
+  ("what's unblocked *now*?") rather than pre-computing every layer. This is what makes a bad early
+  plan recoverable and lets file-overlap avoidance move forward into planning.
+- **Fully unattended** — no human planning gate; oversight is the **hard test gates** during the
+  run and the **draft PR** after it.
+- **Per-stage model routing** — planner Opus/high (unsupervised single point of failure), implement
+  Sonnet/med (house default), review Opus/med, merge Opus/high (fragile semantic conflicts),
+  preflight & gates Haiku/low (mechanical).
+- **Robustness over speed/cost** — worktree isolation (each may install its own deps) and a full
+  test run at every gate. It deliberately spends more to stay correct.
+- **Test gate is absolute** — nothing advances on a red suite: baseline, per-ticket, and every
+  post-merge run.
 - **Spec vs ticket by structure, not labels** — so it needs no new labelling discipline and no
   changes to the Matt-Pocock skills.
 
 ## Safety
 
-- Never fakes a green suite or a passing review; a stuck ticket is left **open** with an
-  explanation, and its layer halts.
-- Aborts before writing any code if the **baseline is red** or the **plan reviewer** has a major
-  doubt.
+- Never fakes a green suite or a passing review; a stuck issue is left **open** with an
+  explanation after two attempts, and the run keeps going on the rest of the backlog.
+- Aborts before writing any code if the **baseline is red**. A merge that breaks the suite is
+  **rolled back** — a red suite never lands.
 - **Subagents write to your tracker** (assign, comment, close issues; push a branch; open a PR).
   Only run it against a repo where that is acceptable — launching the workflow is your
   authorization for those writes.
@@ -87,7 +97,8 @@ Workflow({
   args: {
     repo: "owner/name",       // optional — inferred from git origin if omitted
     label: "ready-for-agent", // optional — the "buildable" label
-    retries: 1,               // optional — conflict rebuilds per ticket
+    maxRounds: 10,            // optional — outer re-plan loop cap (termination)
+    maxAttempts: 2,           // optional — per-issue failures before an issue is set aside (k)
     push: true                // optional — false = keep integration branch local, no PR
   }
 })
@@ -96,8 +107,12 @@ Workflow({
 ## Returns
 
 ```js
-{ integrationBranch, baseBranch, completed: [numbers], failed: [{number, summary}],
-  halted: boolean, pr: url|null, pushed: boolean }
+{ integrationBranch, baseBranch,
+  completed: [numbers],                     // landed on the integration branch and closed
+  unfinished: [{number, reason}],           // left open (set-aside or not reached)
+  setAside: [{number, reason}],             // hit the attempt cap
+  rounds: number, stoppedBy: string,        // "empty-batch" | "max-rounds" | "budget" | ...
+  pr: url|null, pushed: boolean }
 ```
 
 ## Notes

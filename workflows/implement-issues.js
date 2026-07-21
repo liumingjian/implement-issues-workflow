@@ -1,23 +1,38 @@
 export const meta = {
   name: 'implement-issues',
-  description: 'Unattended DAG-parallel implement loop: build the ticket DAG (leaf tickets only), auto-review the plan, then build each topological layer in parallel worktrees behind hard test gates, integrating onto a branch for human review',
-  whenToUse: 'Run the /implement discipline over a whole backlog without babysitting, exploiting the dependency DAG for parallelism. Works against any repo following the Matt-Pocock issue-tracker convention (docs/agents/issue-tracker.md). Zero changes to the Matt skills.',
+  description: 'Unattended dynamic re-plan loop: each round the planner releases only the currently-unblocked batch of leaf tickets (logical + file-overlap + API-shape blocking), builds them in parallel worktrees (TDD), reviews, then serially merges behind a hard full-suite gate — integrating onto a branch for human review',
+  whenToUse: 'Run the /implement discipline over a whole backlog without babysitting. Instead of committing to one big up-front DAG, it re-plans every round and only releases issues that are safe to build right now, so a planning mistake self-corrects and file-overlapping tickets get serialized instead of colliding at merge. Works against any repo following the Matt-Pocock issue-tracker convention (docs/agents/issue-tracker.md). Zero changes to the Matt skills.',
   phases: [
-    { title: 'Preflight', detail: 'baseline test gate + create integration branch' },
-    { title: 'Plan', detail: 'build leaf-ticket DAG, topological layers' },
-    { title: 'Review', detail: 'auto-reviewer vets the plan (abort power)' },
-    { title: 'Execute', detail: 'per layer: parallel worktree builds -> serial integration behind test gates' },
-    { title: 'Finalize', detail: 'push integration branch + open draft PR' },
+    { title: 'Preflight', detail: 'baseline test gate + create integration branch', model: 'haiku' },
+    { title: 'Plan', detail: 'release the currently-unblocked batch (re-planned each round)', model: 'opus' },
+    { title: 'Build', detail: 'per issue: parallel worktree /tdd build + /code-review', model: 'sonnet' },
+    { title: 'Merge', detail: 'serial merge behind the full-suite gate; resolve conflicts in place', model: 'opus' },
+    { title: 'Finalize', detail: 'push integration branch + open draft PR', model: 'haiku' },
   ],
 }
 
 // ---- Config (all optional, via args) ---------------------------------------
-const REPO     = args?.repo    ?? null
-const LABEL    = args?.label   ?? 'ready-for-agent'
-const RETRIES  = args?.retries ?? 1          // conflict re-runs per ticket before giving up
-const PUSH     = args?.push    ?? true       // push integration branch + open draft PR
+const REPO         = args?.repo        ?? null
+const LABEL        = args?.label       ?? 'ready-for-agent'
+const PUSH         = args?.push        ?? true   // push integration branch + open draft PR
+const MAX_ROUNDS   = args?.maxRounds   ?? 10     // outer re-plan loop cap (termination)
+const MAX_ATTEMPTS = args?.maxAttempts ?? 2      // per-issue failures before set-aside (D6, k=2)
 const repoFlag = REPO ? `--repo ${REPO}` : ''
 const repoNote = REPO ? `Repository: ${REPO}.` : 'Infer the repo from the current git origin.'
+
+// Deterministic branch/worktree names → idempotent re-plan + branch reuse (D5, §6).
+const branchOf   = (n) => `wf/issue-${n}`
+const worktreeOf = (n) => `../wf-worktrees/issue-${n}`
+
+// Model routing (D8/§5). Short aliases map to the current tiers:
+//   opus → Opus 4.8 · sonnet → Sonnet 5 · haiku → Haiku 4.5
+const M = {
+  plan:      { model: 'opus',   effort: 'high'   }, // unsupervised single point of failure — top model hedges the dropped human gate
+  implement: { model: 'sonnet', effort: 'medium' }, // day-to-day coding, the house default
+  review:    { model: 'opus',   effort: 'medium' }, // deeper checklist: security, edge cases, behaviour-preservation
+  merge:     { model: 'opus',   effort: 'high'   }, // semantic conflicts are fragile — last line before a bad merge
+  gate:      { model: 'haiku',  effort: 'low'    }, // mechanical: run the suite, report green
+}
 
 // ---- Schemas ---------------------------------------------------------------
 const PREFLIGHT_SCHEMA = {
@@ -37,65 +52,58 @@ const TICKET = {
   required: ['number', 'title'],
 }
 
+const REASONED = {
+  type: 'object', additionalProperties: false,
+  properties: { number: { type: 'integer' }, reason: { type: 'string' } },
+  required: ['number', 'reason'],
+}
+
+// The planner releases ONLY the currently-unblocked batch this round (no static full DAG).
 const PLAN_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
-    layers: { type: 'array', items: { type: 'array', items: TICKET } },
-    excluded: {
-      type: 'array',
-      items: {
-        type: 'object', additionalProperties: false,
-        properties: { number: { type: 'integer' }, reason: { type: 'string' } },
-        required: ['number', 'reason'],
-      },
-    },
+    batch:    { type: 'array', items: TICKET },    // release now, safe to build in parallel
+    deferred: { type: 'array', items: REASONED },  // blocked this round (logical/file-overlap/api-shape)
+    excluded: { type: 'array', items: REASONED },  // umbrella/spec issues dropped (leaf-only)
+    summary:  { type: 'string' },
+  },
+  required: ['batch', 'deferred', 'excluded', 'summary'],
+}
+
+const IMPLEMENT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    number: { type: 'integer' },
+    status: { type: 'string', enum: ['success', 'failed'] },
+    committed: { type: 'boolean' },   // did any work land on the branch?
+    testsPassed: { type: 'boolean' }, // per-ticket full-suite gate inside the worktree
     summary: { type: 'string' },
   },
-  required: ['layers', 'excluded', 'summary'],
+  required: ['number', 'status', 'committed', 'testsPassed', 'summary'],
 }
 
 const REVIEW_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
-    verdict: { type: 'string', enum: ['proceed', 'abort'] },
-    layers: { type: 'array', items: { type: 'array', items: TICKET } }, // possibly-corrected
-    fixes: { type: 'array', items: { type: 'string' } },
-    concerns: { type: 'array', items: { type: 'string' } },
-    reason: { type: 'string' },
-  },
-  required: ['verdict', 'layers', 'fixes', 'concerns', 'reason'],
-}
-
-const BUILD_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  properties: {
     number: { type: 'integer' },
     status: { type: 'string', enum: ['success', 'failed'] },
-    branch: { type: 'string' },
-    testsPassed: { type: 'boolean' },
-    reviewPassed: { type: 'boolean' },
+    changed: { type: 'boolean' },   // did the review commit fixes?
     summary: { type: 'string' },
   },
-  required: ['number', 'status', 'branch', 'testsPassed', 'reviewPassed', 'summary'],
+  required: ['number', 'status', 'changed', 'summary'],
 }
 
-const INTEGRATE_SCHEMA = {
+const MERGE_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
     number: { type: 'integer' },
-    result: { type: 'string', enum: ['clean', 'conflict'] },
-    integrationTestsPassed: { type: 'boolean' },
+    result: { type: 'string', enum: ['clean', 'failed'] }, // failed = unresolved conflict OR post-merge red (rolled back)
+    testsPassed: { type: 'boolean' },
     issueClosed: { type: 'boolean' },
     commit: { type: 'string' },
     summary: { type: 'string' },
   },
-  required: ['number', 'result', 'integrationTestsPassed', 'issueClosed', 'summary'],
-}
-
-const GATE_SCHEMA = {
-  type: 'object', additionalProperties: false,
-  properties: { green: { type: 'boolean' }, summary: { type: 'string' } },
-  required: ['green', 'summary'],
+  required: ['number', 'result', 'testsPassed', 'issueClosed', 'summary'],
 }
 
 const FINALIZE_SCHEMA = {
@@ -108,7 +116,7 @@ const FINALIZE_SCHEMA = {
   required: ['pushed', 'summary'],
 }
 
-// ---- Prompts ---------------------------------------------------------------
+// ---- Prompts (inline; delegate to skills per D10) --------------------------
 const preflightPrompt = `
 You are the PREFLIGHT gate for an unattended implementation run. ${repoNote}
 Do NOT implement anything.
@@ -125,230 +133,228 @@ Do NOT implement anything.
 Return ONLY the structured object.
 `
 
-const planPrompt = `
-You are the PLANNER. ${repoNote} Do NOT write code. Build the implementation DAG.
+const planPrompt = (round, setAside) => `
+You are the PLANNER for round ${round} of an unattended implementation loop. ${repoNote}
+Do NOT write code. You do NOT commit to a full DAG — each round you release ONLY the issues that
+are safe to build in parallel RIGHT NOW. A mistake affects one round; the next re-plan corrects it.
 
 1. Read docs/agents/issue-tracker.md for tracker conventions.
 2. List OPEN issues carrying the "${LABEL}" label:
    gh issue list ${repoFlag} --state open --label "${LABEL}" --json number,title
-3. SELECT ONLY LEAF TICKETS. Both /to-spec (specs) and /to-tickets (tickets) carry "${LABEL}",
-   so the label alone is NOT enough. A spec/umbrella is a PARENT issue (it has sub-issues); an
-   implementable ticket is a LEAF. For each candidate check:
-   gh api repos/<owner>/<name>/issues/<number> --jq '.sub_issues_summary.total'
-   Keep it ONLY if that total is 0. Put every excluded issue (with total>0, i.e. an umbrella
-   spec) into "excluded" with a reason. Also semantically double-check: if a leaf still clearly
-   reads as a scope/spec document rather than a concrete buildable behaviour, exclude it too.
-4. For each remaining leaf, query its blockers:
-   gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by --jq '.[].number'
-   Only edges among the selected leaf tickets matter (ignore blockers that are closed or not in
-   the set).
-5. Build the DAG and produce TOPOLOGICAL LAYERS: layer 0 = tickets with no open blocker in the
-   set; layer k = tickets whose blockers all live in layers < k. Tickets within a layer are
-   mutually independent and safe to build in parallel. Order layers 0..N; within a layer order
-   by ascending issue number.
-Return ONLY the structured object (layers as arrays of {number,title}).
-`
-
-const reviewPrompt = (plan) => `
-You are the PLAN REVIEWER — the only safeguard before code gets written unattended. You have
-ABORT POWER. ${repoNote}
-
-Here is the proposed plan:
-${JSON.stringify(plan, null, 2)}
-
-Vet it on two levels:
-A. STRUCTURE — cycles, mis-layering, or any umbrella/spec issue that slipped in (re-check
-   sub_issues_summary.total via gh api if unsure). Structural problems you can safely fix
-   yourself: drop mis-included specs, break an obviously-wrong cycle, re-order a layer. Apply
-   those fixes and return the corrected "layers", listing what you changed in "fixes".
-B. DIRECTION — does the sequencing make sense? Any ticket whose real dependency is missing from
-   the graph, or a layer that clearly cannot be built safely in parallel? These are MAJOR doubts
-   you must NOT silently fix.
-
-Verdict:
-- "proceed" if structure is sound (after your fixes) and you have no major directional doubt.
-  Return the final "layers" to execute.
-- "abort" if you have a major directional concern — list it in "concerns" and explain in
-  "reason". Do NOT proceed on a plan you doubt; a bad DAG means bulk-wrong code changes.
+3. LEAF-ONLY. Both /to-spec (specs) and /to-tickets (tickets) carry "${LABEL}", so the label alone
+   is not enough. An umbrella/spec is a PARENT issue; an implementable ticket is a LEAF. For each
+   candidate:
+     gh api repos/<owner>/<name>/issues/<number> --jq '.sub_issues_summary.total'
+   Keep it ONLY if that total is 0. Put every dropped umbrella (total>0, or a leaf that still
+   clearly reads as a scope/spec document rather than a concrete buildable behaviour) into
+   "excluded" with a reason.
+4. SET-ASIDE. Exclude these issues entirely — they hit the per-issue attempt cap in earlier
+   rounds and are intentionally parked: ${setAside.length ? setAside.join(', ') : 'none'}.
+5. RELEASE THE CURRENTLY-UNBLOCKED BATCH. Of the remaining leaf issues, an issue is BLOCKED this
+   round if ANY of these three criteria holds:
+   a. LOGICAL dependency — it has an OPEN blocker in the set:
+        gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by --jq '.[].number'
+      A blocker that is CLOSED is satisfied — ignore it. Defer the blocked issue.
+   b. FILE OVERLAP — it will likely edit the SAME files as another candidate this round (read the
+      issues; infer which files/modules each will touch). Overlapping issues MUST be serialized:
+      release ONE now, defer the rest to a later round. This is what prevents clean-merge / red-test
+      collisions at integration.
+   c. API SHAPE — it consumes a type/interface/function signature that another not-yet-built
+      candidate this round will introduce or change. Release the producer, defer the consumer.
+   NEVER defer an entire overlap/dependency group — always release at least one member so the loop
+   makes progress. Put every deferred issue in "deferred" with its reason (logical/file-overlap/api-shape).
+6. Emit "batch" = the released issues as {number,title}, ordered by ascending number. An empty
+   batch is valid (everything open is blocked, deferred, or set aside) and ends the run.
 Return ONLY the structured object.
 `
 
-const buildPrompt = (t, integrationBranch, attempt) => `
-You build EXACTLY ONE ticket in an ISOLATED git worktree. Never touch the main working tree or
-the integration branch directly. ${repoNote}
+const implementPrompt = (t, integ) => `
+You implement EXACTLY ONE issue TEST-FIRST in an ISOLATED git worktree. Never touch the main
+working tree or the integration branch directly. ${repoNote}
 
-Ticket #${t.number} — "${t.title}". Integration branch: ${integrationBranch}. Attempt: ${attempt}.
-${attempt > 1 ? 'A previous attempt CONFLICTED at integration; you are rebuilding against the now-updated integration tip.' : ''}
+Issue #${t.number} — "${t.title}". Integration branch: ${integ}. Branch: ${branchOf(t.number)}.
 
-Steps:
 0. Read docs/agents/issue-tracker.md and the coding-standards doc (CLAUDE.md).
-1. Claim the ticket: gh issue edit ${t.number} ${repoFlag} --add-assignee @me
+1. Claim it: gh issue edit ${t.number} ${repoFlag} --add-assignee @me
 2. Read it fully: gh issue view ${t.number} ${repoFlag} --comments
-3. Create an isolated worktree branched from the CURRENT tip of ${integrationBranch}:
+3. Set up the worktree, REUSING branch ${branchOf(t.number)} if it already exists — accumulate
+   progress across rounds, NEVER rebuild from scratch:
      root=$(git rev-parse --show-toplevel)
-     wt="$root/../wf-worktrees/ticket-${t.number}-a${attempt}"
-     git worktree add -B wf/ticket-${t.number}-a${attempt} "$wt" ${integrationBranch}
-   Do ALL work inside "$wt".
-4. Install dependencies there if the project needs them (e.g. npm install).
-5. Build TEST-FIRST — red → green, slice by slice — until the ticket's spec is satisfied. Keep
-   changes surgical: only what this ticket asks for.
-6. GATE (per-ticket): run the FULL test suite inside the worktree; it must be 100% green.
-7. GATE (per-ticket): review your own diff on two axes — Standards (repo coding standards) and
-   Spec (does the diff deliver exactly what #${t.number} asked?). Fix until BOTH pass.
-8. Commit to branch wf/ticket-${t.number}-a${attempt} with a message referencing #${t.number}.
-   Do NOT merge, do NOT push, do NOT close the issue — integration is a separate step.
-9. Report status "success" and branch = "wf/ticket-${t.number}-a${attempt}".
+     wt="$root/${worktreeOf(t.number)}"
+     if git show-ref --verify --quiet refs/heads/${branchOf(t.number)}; then
+       git worktree add "$wt" ${branchOf(t.number)} 2>/dev/null || true   # reuse existing branch
+     else
+       git worktree add -B ${branchOf(t.number)} "$wt" ${integ}            # fresh off the current tip
+     fi
+   Do ALL work inside "$wt". Install dependencies there if the project needs them (e.g. npm install).
+4. Drive the implementation with the /tdd skill: red → green, slice by slice, until the issue's
+   spec is satisfied. Keep changes surgical — only what this issue asks for. If the branch already
+   satisfies the spec with a green suite (a merge-retry round), make no changes.
+5. GATE (per-ticket): run the FULL test suite inside the worktree; it must be 100% green.
+6. Commit to branch ${branchOf(t.number)} with a message referencing #${t.number}. Do NOT merge,
+   do NOT push, do NOT CLOSE the issue — integration is a separate stage.
 
-If you cannot make the suite green or the spec is ambiguous, STOP: status "failed", leave the
-issue open, explain precisely. NEVER fake a green suite or a passing review.
+If you cannot make the suite green or the spec is ambiguous, STOP: status "failed", leave the issue
+open, explain precisely. NEVER fake a green suite. Report committed=true only if work is on the branch.
 Return ONLY the structured object.
 `
 
-const integratePrompt = (number, branch, integrationBranch) => `
-You integrate ONE already-built, already-reviewed ticket branch into the integration branch and
-verify it. Work in the MAIN working tree. ${repoNote}
+const reviewPrompt = (t, integ) => `
+You REVIEW one freshly-implemented issue branch and FIX what you find. ${repoNote}
+Issue #${t.number} — "${t.title}". Branch: ${branchOf(t.number)} (already committed, suite green).
+Work inside its worktree: "$(git rev-parse --show-toplevel)/${worktreeOf(t.number)}".
 
-Ticket #${number}. Source branch: ${branch}. Integration branch: ${integrationBranch}.
+Review this branch's diff versus the integration tip (${integ}) using the /code-review skill on
+BOTH axes:
+  - Standards — does it follow this repo's documented coding standards?
+  - Spec — does it deliver EXACTLY what #${t.number} asked, no more and no less?
+NESTING NOTE: you are already a subagent. If /code-review cannot fan out its own parallel
+sub-agents (one-level nesting cap), run the two axes sequentially yourself with the same checklist
+depth — same discipline, minus the parallelism.
 
-1. git checkout ${integrationBranch}
-2. git merge --no-ff ${branch} -m "Integrate #${number}"
-   - If git reports merge CONFLICTS: run \`git merge --abort\`, set result="conflict",
-     issueClosed=false, and STOP.
-3. GATE (post-merge integration): run the FULL test suite on ${integrationBranch}.
-   - If RED (a semantic conflict that merged cleanly but broke behaviour): undo the merge with
-     \`git reset --hard HEAD~1\`, set result="conflict", integrationTestsPassed=false,
-     issueClosed=false, and STOP.
-4. If the merge is clean AND the suite is green: this ticket has truly landed. Now resolve it —
-   post a resolution comment on #${number} summarising what shipped, then
-   \`gh issue close ${number} ${repoFlag} --comment "..."\`. Set result="clean",
-   integrationTestsPassed=true, issueClosed=true, and report the merge commit sha.
+Fix every real issue you find, re-run the FULL suite (it must STAY green), and commit the fixes to
+the same branch (${branchOf(t.number)}). Do NOT merge, push, or close.
+Return ONLY the structured object (changed=true only if you committed fixes).
+`
+
+const mergePrompt = (t, integ) => `
+You MERGE one built-and-reviewed branch into the integration branch and verify it. Work in the
+MAIN working tree. ${repoNote}
+
+Issue #${t.number}. Source branch: ${branchOf(t.number)}. Integration branch: ${integ}.
+
+1. git checkout ${integ}
+2. git merge --no-ff ${branchOf(t.number)} -m "Integrate #${t.number}"
+3. If git reports CONFLICTS: resolve them IN PLACE using the /resolving-merge-conflicts skill —
+   read BOTH sides and reconcile the intent. NEVER rebuild the branch, NEVER blindly abort.
+   Commit the resolution.
+4. HARD GATE (post-merge): run the FULL test suite on ${integ}.
+   - If RED — a conflict you could not cleanly resolve, OR a semantic conflict that merged cleanly
+     but broke behaviour — roll back THIS ONE merge: \`git merge --abort\` if mid-merge, else
+     \`git reset --hard HEAD~1\`. Set result="failed", testsPassed=false, issueClosed=false, STOP.
+     The issue stays OPEN for a later round; its branch progress is preserved.
+5. Clean merge AND green suite → the issue has truly landed. Post a resolution comment on
+   #${t.number} summarising what shipped, then \`gh issue close ${t.number} ${repoFlag} --comment "..."\`.
+   Set result="clean", testsPassed=true, issueClosed=true, and report the merge commit sha.
+
+NEVER fake a green suite. NEVER merge into anything but ${integ}.
 Return ONLY the structured object.
 `
 
-const layerGatePrompt = (integrationBranch, n) => `
-You are the LAYER ${n} BARRIER gate. In the main working tree, checkout ${integrationBranch} and
-run the FULL test suite once more. Report green=true only if 100% pass. Do not change any code.
-Return ONLY the structured object.
-`
-
-const finalizePrompt = (integrationBranch, baseBranch, done, failed) => `
+const finalizePrompt = (integ, baseBranch, done, unfinished) => `
 You finalize an unattended implementation run. ${repoNote}
 
-Integration branch: ${integrationBranch}. Base branch: ${baseBranch}.
-Completed tickets: ${done.join(', ') || 'none'}. Failed/left-open: ${failed.map(f => '#' + f.number).join(', ') || 'none'}.
+Integration branch: ${integ}. Base branch: ${baseBranch}.
+Landed & closed: ${done.map(n => '#' + n).join(', ') || 'none'}.
+Left open (unfinished / set-aside): ${unfinished.map(u => `#${u.number} (${u.reason})`).join(', ') || 'none'}.
 
 1. Cleanup worktrees: \`git worktree prune\` and remove any leftover under ../wf-worktrees.
 2. ${PUSH
-    ? `Push the integration branch: \`git push -u origin ${integrationBranch}\`. Then open a DRAFT PR into ${baseBranch}:
-   \`gh pr create ${repoFlag} --draft --base ${baseBranch} --head ${integrationBranch} --title "Unattended implementation: ${done.length} tickets" --body "..."\`.
-   In the PR body summarise per-ticket what shipped and list any failed/left-open tickets for human attention. Report pushed=true and the PR url.`
+    ? `Push the integration branch: \`git push -u origin ${integ}\`. Then open a DRAFT PR into ${baseBranch}:
+   \`gh pr create ${repoFlag} --draft --base ${baseBranch} --head ${integ} --title "Unattended implementation: ${done.length} issue(s)" --body "..."\`.
+   In the PR body summarise per-issue what shipped, and list every left-open/set-aside issue (with
+   its reason) for human attention. Also \`gh issue list ${repoFlag} --state open --label "${LABEL}"\`
+   and note any still-open buildable issue not already listed above as "not reached this run".
+   Report pushed=true and the PR url.`
     : `Do NOT push (offline mode). Leave the integration branch local. Report pushed=false.`}
 NEVER merge into ${baseBranch} — a human owns that final gate.
 Return ONLY the structured object.
 `
 
 // ---- Orchestration ---------------------------------------------------------
-log(`implement-issues v2 — label="${LABEL}", retries=${RETRIES}, push=${PUSH}`)
+log(`implement-issues v3 — label="${LABEL}", maxRounds=${MAX_ROUNDS}, k=${MAX_ATTEMPTS}, push=${PUSH}`)
 
 phase('Preflight')
-const pre = await agent(preflightPrompt, { schema: PREFLIGHT_SCHEMA, phase: 'Preflight', label: 'preflight' })
+const pre = await agent(preflightPrompt, { ...M.gate, schema: PREFLIGHT_SCHEMA, phase: 'Preflight', label: 'preflight' })
 if (!pre) { log('preflight agent failed — aborting'); return { aborted: 'preflight-failed' } }
 if (!pre.baseGreen) { log(`baseline RED — aborting: ${pre.summary}`); return { aborted: 'baseline-red', detail: pre.summary } }
 const integ = pre.integrationBranch
 const baseBranch = pre.baseBranch
 log(`baseline green; integration branch = ${integ} (base ${baseBranch})`)
 
-phase('Plan')
-const plan = await agent(planPrompt, { schema: PLAN_SCHEMA, phase: 'Plan', label: 'plan' })
-if (!plan || !plan.layers?.length || !plan.layers.some(l => l.length)) {
-  log('no buildable leaf tickets found — nothing to do')
-  return { aborted: 'empty-plan', excluded: plan?.excluded ?? [] }
+const done = []                 // issue numbers landed on the integration branch and closed
+const attempts = new Map()      // issue number -> failure count (implement-fail or merge-rollback), persists across rounds
+const setAside = new Map()      // issue number -> reason (hit the attempt cap; excluded from later rounds)
+const bump = (n, why) => {
+  const c = (attempts.get(n) ?? 0) + 1
+  attempts.set(n, c)
+  if (c >= MAX_ATTEMPTS && !setAside.has(n)) setAside.set(n, `${c} failed attempt(s): ${why}`)
 }
-log(`plan: ${plan.layers.length} layers, ${plan.layers.flat().length} tickets; excluded ${plan.excluded.length} spec/umbrella issues`)
 
-phase('Review')
-const rev = await agent(reviewPrompt(plan), { schema: REVIEW_SCHEMA, phase: 'Review', label: 'plan-review' })
-if (!rev) { log('plan reviewer failed — aborting for safety'); return { aborted: 'review-failed' } }
-if (rev.verdict === 'abort') {
-  log(`plan reviewer ABORTED: ${rev.reason}`)
-  return { aborted: 'reviewer-abort', concerns: rev.concerns, reason: rev.reason }
-}
-const layers = (rev.layers && rev.layers.some(l => l.length)) ? rev.layers : plan.layers
-if (rev.fixes.length) log(`reviewer applied fixes: ${rev.fixes.join('; ')}`)
-
-const done = []
-const failed = []
-let halted = false
-
-for (let i = 0; i < layers.length && !halted; i++) {
-  const layer = layers[i]
-  if (!layer.length) continue
-  const pn = `Layer ${i + 1}`
-  phase(pn)
-  log(`${pn}/${layers.length}: ${layer.length} ticket(s) [${layer.map(t => '#' + t.number).join(', ')}] — building in parallel worktrees`)
+let round = 0
+let stop = null
+while (round < MAX_ROUNDS) {
+  round++
+  const pn = `Round ${round}`
 
   if (budget.total && budget.remaining() < 120_000) {
-    log(`budget low (${Math.round(budget.remaining() / 1000)}k) — stopping before layer ${i + 1}`)
-    halted = true; break
+    log(`budget low (${Math.round(budget.remaining() / 1000)}k) — stopping before round ${round}`)
+    stop = 'budget'; break
   }
 
-  // Parallel isolated builds (each agent manages its own git worktree)
-  const builds = await parallel(layer.map(t => () =>
-    agent(buildPrompt(t, integ, 1), { schema: BUILD_SCHEMA, phase: pn, label: `build:#${t.number}` })
-  ))
+  phase(pn)
+  const setAsideList = [...setAside.keys()]
+  const plan = await agent(planPrompt(round, setAsideList), { ...M.plan, schema: PLAN_SCHEMA, phase: pn, label: `plan:r${round}` })
+  if (!plan) { log(`round ${round}: planner failed — ending run for safety`); stop = 'plan-failed'; break }
+  if (!plan.batch.length) {
+    log(`round ${round}: empty batch (${plan.deferred.length} deferred, ${plan.excluded.length} excluded) — nothing left to release`)
+    stop = 'empty-batch'; break
+  }
+  log(`round ${round}: releasing [${plan.batch.map(t => '#' + t.number).join(', ')}]` +
+      `${plan.deferred.length ? `; deferred ${plan.deferred.map(d => '#' + d.number).join(', ')}` : ''}`)
 
-  // Serial integration behind the post-merge test gate
-  for (let k = 0; k < layer.length; k++) {
-    const t = layer[k]
+  // Fan-out: each issue builds (Sonnet /tdd) then reviews (Opus /code-review) in its own worktree.
+  const builds = await parallel(plan.batch.map(t => async () => {
+    const impl = await agent(implementPrompt(t, integ), { ...M.implement, schema: IMPLEMENT_SCHEMA, phase: pn, label: `impl:#${t.number}` })
+    if (!impl || impl.status !== 'success' || !impl.testsPassed || !impl.committed) {
+      return { number: t.number, buildOk: false, summary: impl?.summary ?? 'implement agent died' }
+    }
+    // Review runs ONLY when the implement stage produced commits (D9).
+    const rev = await agent(reviewPrompt(t, integ), { ...M.review, schema: REVIEW_SCHEMA, phase: pn, label: `review:#${t.number}` })
+    return { number: t.number, buildOk: true, reviewOk: !!(rev && rev.status === 'success'), summary: rev?.summary ?? impl.summary }
+  }))
+
+  // Serial merge behind the hard full-suite gate (this per-merge run IS the barrier — no separate layer gate).
+  for (let k = 0; k < plan.batch.length; k++) {
+    const t = plan.batch[k]
     const b = builds[k]
-    if (!b || b.status !== 'success') {
-      failed.push({ number: t.number, summary: b?.summary ?? 'build failed/agent died' })
-      log(`#${t.number} build failed — halting layer for human review`)
-      halted = true; break
+    if (!b || !b.buildOk) {
+      bump(t.number, 'build failed')
+      log(`#${t.number} build failed (${attempts.get(t.number)}/${MAX_ATTEMPTS})${setAside.has(t.number) ? ' — set aside' : ''}`)
+      continue
     }
+    if (b.reviewOk === false) log(`#${t.number} review incomplete — merging the gated build anyway`)
 
-    let res = await agent(integratePrompt(t.number, b.branch, integ), { schema: INTEGRATE_SCHEMA, phase: pn, label: `integrate:#${t.number}` })
-
-    // Conflict -> rebuild against updated tip, up to RETRIES
-    let attempt = 1
-    while (res && res.result === 'conflict' && attempt <= RETRIES) {
-      attempt++
-      log(`#${t.number} conflict at integration — rebuild attempt ${attempt} against updated ${integ}`)
-      const rb = await agent(buildPrompt(t, integ, attempt), { schema: BUILD_SCHEMA, phase: pn, label: `rebuild:#${t.number}(a${attempt})` })
-      if (!rb || rb.status !== 'success') { res = null; break }
-      res = await agent(integratePrompt(t.number, rb.branch, integ), { schema: INTEGRATE_SCHEMA, phase: pn, label: `integrate:#${t.number}(a${attempt})` })
+    const merge = await agent(mergePrompt(t, integ), { ...M.merge, schema: MERGE_SCHEMA, phase: pn, label: `merge:#${t.number}` })
+    if (merge && merge.result === 'clean' && merge.testsPassed && merge.issueClosed) {
+      done.push(t.number)
+      log(`#${t.number} integrated (${merge.commit ?? 'merged'}) and closed`)
+    } else {
+      bump(t.number, merge?.summary ?? 'merge agent died')
+      log(`#${t.number} merge rolled back (${attempts.get(t.number)}/${MAX_ATTEMPTS})${setAside.has(t.number) ? ' — set aside' : ''}`)
     }
-
-    if (!res || res.result !== 'clean') {
-      failed.push({ number: t.number, summary: res?.summary ?? 'unresolved conflict after retries' })
-      log(`#${t.number} could not integrate — halting layer for human review`)
-      halted = true; break
-    }
-    done.push(t.number)
-    log(`#${t.number} integrated (${res.commit ?? 'merged'}) and closed`)
   }
+}
 
-  if (halted) break
-
-  // Layer barrier gate
-  const gate = await agent(layerGatePrompt(integ, i + 1), { schema: GATE_SCHEMA, phase: pn, label: `barrier:L${i + 1}` })
-  if (!gate || !gate.green) {
-    log(`layer ${i + 1} barrier RED — halting: ${gate?.summary ?? 'gate agent died'}`)
-    halted = true; break
-  }
-  log(`layer ${i + 1} barrier green`)
+// Everything touched but not landed: set-aside plus any still-open at run end.
+const unfinished = []
+for (const [n, c] of attempts) {
+  if (done.includes(n)) continue
+  unfinished.push({ number: n, reason: setAside.get(n) ?? `attempted ${c}x, not landed (${stop ?? 'incomplete'})` })
 }
 
 phase('Finalize')
-const fin = await agent(finalizePrompt(integ, baseBranch, done, failed), { schema: FINALIZE_SCHEMA, phase: 'Finalize', label: 'finalize' })
+const fin = await agent(finalizePrompt(integ, baseBranch, done, unfinished), { ...M.gate, schema: FINALIZE_SCHEMA, phase: 'Finalize', label: 'finalize' })
 
-log(`done: ${done.length} integrated, ${failed.length} failed/left-open, halted=${halted}`)
+log(`done: ${done.length} landed, ${unfinished.length} left open, ${round} round(s), stop=${stop ?? 'max-rounds'}`)
 return {
   integrationBranch: integ,
   baseBranch,
   completed: done,
-  failed,
-  halted,
+  unfinished,
+  setAside: [...setAside.entries()].map(([number, reason]) => ({ number, reason })),
+  rounds: round,
+  stoppedBy: stop ?? 'max-rounds',
   pr: fin?.prUrl ?? null,
   pushed: fin?.pushed ?? false,
 }
