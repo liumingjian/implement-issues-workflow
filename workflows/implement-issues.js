@@ -2,10 +2,12 @@ export const meta = {
   name: 'implement-issues',
   description: 'Unattended dynamic re-plan loop: each round the planner releases only the currently-unblocked batch of leaf tickets (logical + file-overlap + API-shape blocking), builds them in parallel worktrees (TDD), reviews, then serially merges behind a hard full-suite gate — integrating onto a branch for human review',
   whenToUse: 'Run the /implement discipline over a whole backlog without babysitting. Instead of committing to one big up-front DAG, it re-plans every round and only releases issues that are safe to build right now, so a planning mistake self-corrects and file-overlapping tickets get serialized instead of colliding at merge. Works against any repo following the Matt-Pocock issue-tracker convention (docs/agents/issue-tracker.md). Zero changes to the Matt skills.',
+  // Stage → model per §5 (effort per stage lives in the `M` table below — the routing source of truth).
   phases: [
     { title: 'Preflight', detail: 'baseline test gate + create integration branch', model: 'haiku' },
     { title: 'Plan', detail: 'release the currently-unblocked batch (re-planned each round)', model: 'opus' },
-    { title: 'Build', detail: 'per issue: parallel worktree /tdd build + /code-review', model: 'sonnet' },
+    { title: 'Implement', detail: 'per issue, parallel worktree: /tdd build behind the per-ticket suite gate', model: 'sonnet' },
+    { title: 'Review', detail: 'per issue: /code-review (Standards + Spec), only if the build committed', model: 'opus' },
     { title: 'Merge', detail: 'serial merge behind the full-suite gate; resolve conflicts in place', model: 'opus' },
     { title: 'Finalize', detail: 'push integration branch + open draft PR', model: 'haiku' },
   ],
