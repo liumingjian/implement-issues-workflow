@@ -1,10 +1,9 @@
 # implement-issues v3 — dynamic re-plan loop (design decisions)
 
-**Status:** decided, not yet implemented · **Date:** 2026-07-21
+**Status:** implemented and hardened · **Date:** 2026-07-25
 
-This is a **decision spec**, not code. It records the route agreed for redesigning
-`workflows/implement-issues.js`. No line of the workflow changes until this is implemented as a
-separate, mechanical step.
+This document records the decisions implemented in `workflows/implement-issues.js`, including the
+terminal-plan and dependency-state hardening added after a closed blocker was misread as open.
 
 ---
 
@@ -44,9 +43,9 @@ droppable Claude Code Workflow file. Those are out of scope (§6).
 
 | # | Area | Decision |
 |---|------|----------|
-| D0 | Deliverable | This decision spec. Code changes come after, as a separate step. |
+| D0 | Deliverable | A single-file reusable workflow plus its decision and tracker documentation. |
 | D1 | Planning architecture | Dynamic re-plan loop; each round releases only the currently-unblocked batch; **no static full DAG**. |
-| D2 | Planner input | Explicit tracker `blocked_by` = **authoritative** logical deps (set at `/to-tickets` time). The planner **additionally infers**, each round, *file-overlap* and *API-shape* edges on top. **No DAG file** — logical structure lives in the tracker; conflict-relevant edges are inferred live. |
+| D2 | Planner input | Explicit tracker `blocked_by` relationships identify logical deps, but relationship membership does **not** prove the blocker is open. The planner fetches each blocker's current issue state and defers only for verified-open blockers; issues completed in this run are authoritative across GitHub read lag. It additionally infers live *file-overlap* and *API-shape* edges. **No DAG file.** |
 | D3 | Trust model | **Fully autonomous** planner — no human planning gate. Human oversight moves to hard test gates (during) + the draft PR (after). |
 | D4 | Conflict avoidance | "File overlap" is a blocking criterion, judged by the planner each round (not persisted). |
 | D5 | Residual conflict | Merge agent **resolves in place** by reading both sides. **Reuse the branch** and accumulate progress — never rebuild from scratch. Never halt the run. Keep the hard post-merge full-suite gate: red → roll back *that one* merge, return the issue to the next round. |
@@ -56,7 +55,7 @@ droppable Claude Code Workflow file. Those are out of scope (§6).
 | D9 | Review structure | Separate **Opus** agent, same worktree/branch, **runs only if the implement stage produced commits**. (Forced by D8 — build and review use different models, so they cannot be one agent.) |
 | D10 | Skill delegation | Stage prompts **delegate to existing skills** instead of re-describing them: Implement→`/tdd`, Review→`/code-review`, Merge→`/resolving-merge-conflicts`. `/implement` is **not** used wholesale because it bundles TDD+review under one model, which D8 forbids. See §4. |
 | D11 | Prompt hosting | Prompts stay **inline** in the `.js` (preserves single-file install). Borrow only sandcastle's prompt **content**: the three blocking criteria, the review-checklist depth, the merge "resolve by reading both sides" wording, and "implement stage does not close the issue". |
-| D12 | Kept from v2 | Baseline preflight gate (red base → abort) · leaf-ticket-only selection (drop umbrella parents, `sub_issues_summary.total > 0`) · integration branch + draft PR, **never touch base** · termination = empty batch **or** `MAX_ITERATIONS` (default 10) **or** low budget · Matt-Pocock tracker convention + `ready-for-agent` label. The v2 "layer barrier" **dissolves** — the per-merge full-suite gate already is the barrier. |
+| D12 | Kept from v2 | Baseline preflight gate (red base → abort) · leaf-ticket-only selection · integration branch + draft PR, **never touch base** · termination only after an independently confirmed `complete` or `blocked` frontier, `MAX_ITERATIONS` (default 10), low budget, or planner failure · Matt-Pocock tracker convention + `ready-for-agent` label. The v2 "layer barrier" **dissolves** — the per-merge full-suite gate already is the barrier. |
 
 ## 4. Stage → skill mapping (D10)
 
@@ -90,10 +89,13 @@ off `base`.
 
 **Main loop** (round `r = 1..MAX_ITERATIONS`, while budget allows):
 
-1. **Plan** (Opus/high): list open `ready-for-agent` issues → drop umbrella parents
-   (`sub_issues_summary.total > 0`) and set-aside issues; read `blocked_by`; additionally infer
-   *file-overlap* + *API-shape* edges; emit the **currently-unblocked batch** with deterministic
-   branch names `wf/issue-{id}`. **Empty batch → break the loop.**
+1. **Plan** (Opus/high): list open `ready-for-agent` issues → drop umbrella parents and set-aside
+   issues; treat issues completed in this run as authoritative; discover `blocked_by` relationships
+   and separately verify each blocker's current issue state; additionally infer *file-overlap* +
+   *API-shape* edges. Emit all candidates as an exact `batch`/`deferred` partition with deterministic
+   branch names `wf/issue-{id}`. A terminal or invalid plan is independently re-fetched once:
+   no candidates → `complete`; all candidates waiting on verified-open logical blockers → `blocked`;
+   a non-progressing overlap/API plan → `plan-invalid`.
 2. **Fan-out** (per issue, in parallel; each in its own worktree off the integration tip; reuse
    the branch if it already exists):
    - **Implement** (Sonnet): claim → run `/tdd` red-green for #N → per-ticket full-suite gate →
@@ -108,7 +110,8 @@ off `base`.
    from later rounds).
 5. Re-plan → next round.
 
-**Finalize** (Haiku): prune worktrees; push the integration branch; open a **draft PR** into
+**Finalize** (Haiku): reconcile all still-open buildable leaves—including deferred and
+never-attempted issues—prune worktrees; push the integration branch; open a **draft PR** into
 `base` summarizing what shipped and listing set-aside / unfinished issues. **Never merge into
 `base`.**
 

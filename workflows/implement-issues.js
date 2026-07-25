@@ -60,16 +60,29 @@ const REASONED = {
   required: ['number', 'reason'],
 }
 
-// The planner releases ONLY the currently-unblocked batch this round (no static full DAG).
+const DEFERRED = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    number: { type: 'integer' },
+    title: { type: 'string' },
+    kind: { type: 'string', enum: ['logical', 'file-overlap', 'api-shape'] },
+    blockedBy: { type: 'array', items: { type: 'integer' } },
+    reason: { type: 'string' },
+  },
+  required: ['number', 'title', 'kind', 'blockedBy', 'reason'],
+}
+
+// The planner accounts for every current candidate, then releases only the safe batch.
 const PLAN_SCHEMA = {
   type: 'object', additionalProperties: false,
   properties: {
-    batch:    { type: 'array', items: TICKET },    // release now, safe to build in parallel
-    deferred: { type: 'array', items: REASONED },  // blocked this round (logical/file-overlap/api-shape)
-    excluded: { type: 'array', items: REASONED },  // umbrella/spec issues dropped (leaf-only)
-    summary:  { type: 'string' },
+    candidates: { type: 'array', items: TICKET },
+    batch:      { type: 'array', items: TICKET },
+    deferred:   { type: 'array', items: DEFERRED },
+    excluded:   { type: 'array', items: REASONED },
+    summary:    { type: 'string' },
   },
-  required: ['batch', 'deferred', 'excluded', 'summary'],
+  required: ['candidates', 'batch', 'deferred', 'excluded', 'summary'],
 }
 
 const IMPLEMENT_SCHEMA = {
@@ -113,9 +126,41 @@ const FINALIZE_SCHEMA = {
   properties: {
     pushed: { type: 'boolean' },
     prUrl: { type: 'string' },
+    unfinished: { type: 'array', items: REASONED },
     summary: { type: 'string' },
   },
-  required: ['pushed', 'summary'],
+  required: ['pushed', 'unfinished', 'summary'],
+}
+
+const classifyPlan = (plan, done, setAside) => {
+  const candidateNumbers = plan.candidates.map(t => t.number)
+  const batchNumbers = plan.batch.map(t => t.number)
+  const deferredNumbers = plan.deferred.map(t => t.number)
+  const unique = (numbers) => new Set(numbers).size === numbers.length
+  const ascending = (numbers) => numbers.every((n, i) => i === 0 || numbers[i - 1] < n)
+  const candidateSet = new Set(candidateNumbers)
+  const partition = [...batchNumbers, ...deferredNumbers]
+
+  if (!unique(candidateNumbers) || !unique(batchNumbers) || !unique(deferredNumbers)) {
+    return { kind: 'invalid', reason: 'duplicate issue number in plan' }
+  }
+  if (!ascending(candidateNumbers) || !ascending(batchNumbers)) {
+    return { kind: 'invalid', reason: 'candidates and batch must be strictly ascending' }
+  }
+  if (partition.some(n => !candidateSet.has(n)) || new Set(partition).size !== partition.length ||
+      partition.length !== candidateNumbers.length) {
+    return { kind: 'invalid', reason: 'batch and deferred must exactly partition candidates' }
+  }
+  if (candidateNumbers.some(n => done.includes(n) || setAside.includes(n))) {
+    return { kind: 'invalid', reason: 'completed or set-aside issue appeared as a candidate' }
+  }
+  if (plan.deferred.some(d => !d.blockedBy.length)) {
+    return { kind: 'invalid', reason: 'deferred issue has no blocker evidence' }
+  }
+  if (!candidateNumbers.length) return { kind: 'complete' }
+  if (batchNumbers.length) return { kind: 'ready' }
+  if (plan.deferred.every(d => d.kind === 'logical')) return { kind: 'blocked' }
+  return { kind: 'invalid', reason: 'overlap/API-shape deferral released no issue' }
 }
 
 // ---- Prompts (inline; delegate to skills per D10) --------------------------
@@ -135,38 +180,47 @@ Do NOT implement anything.
 Return ONLY the structured object.
 `
 
-const planPrompt = (round, setAside) => `
-You are the PLANNER for round ${round} of an unattended implementation loop. ${repoNote}
+const planPrompt = (round, setAside, done, mode = 'normal') => `
+You are the PLANNER for round ${round} of an unattended implementation loop (${mode} pass). ${repoNote}
 Do NOT write code. You do NOT commit to a full DAG — each round you release ONLY the issues that
-are safe to build in parallel RIGHT NOW. A mistake affects one round; the next re-plan corrects it.
+are safe to build in parallel RIGHT NOW.
+
+Workflow-owned facts for this run:
+- Completed and closed: ${done.length ? done.map(n => '#' + n).join(', ') : 'none'}.
+- Set aside after the attempt cap: ${setAside.length ? setAside.map(n => '#' + n).join(', ') : 'none'}.
+These facts are authoritative for this run. Remove completed and set-aside issues from candidates.
+A completed issue is also a satisfied dependency even if a GitHub read temporarily lags.
 
 1. Read docs/agents/issue-tracker.md for tracker conventions.
-2. List OPEN issues carrying the "${LABEL}" label:
+2. Freshly list OPEN issues carrying the "${LABEL}" label:
    gh issue list ${repoFlag} --state open --label "${LABEL}" --json number,title
-3. LEAF-ONLY. Both /to-spec (specs) and /to-tickets (tickets) carry "${LABEL}", so the label alone
-   is not enough. An umbrella/spec is a PARENT issue; an implementable ticket is a LEAF. For each
-   candidate:
-     gh api repos/<owner>/<name>/issues/<number> --jq '.sub_issues_summary.total'
-   Keep it ONLY if that total is 0. Put every dropped umbrella (total>0, or a leaf that still
-   clearly reads as a scope/spec document rather than a concrete buildable behaviour) into
-   "excluded" with a reason.
-4. SET-ASIDE. Exclude these issues entirely — they hit the per-issue attempt cap in earlier
-   rounds and are intentionally parked: ${setAside.length ? setAside.join(', ') : 'none'}.
-5. RELEASE THE CURRENTLY-UNBLOCKED BATCH. Of the remaining leaf issues, an issue is BLOCKED this
-   round if ANY of these three criteria holds:
-   a. LOGICAL dependency — it has an OPEN blocker in the set:
-        gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by --jq '.[].number'
-      A blocker that is CLOSED is satisfied — ignore it. Defer the blocked issue.
-   b. FILE OVERLAP — it will likely edit the SAME files as another candidate this round (read the
-      issues; infer which files/modules each will touch). Overlapping issues MUST be serialized:
-      release ONE now, defer the rest to a later round. This is what prevents clean-merge / red-test
-      collisions at integration.
-   c. API SHAPE — it consumes a type/interface/function signature that another not-yet-built
-      candidate this round will introduce or change. Release the producer, defer the consumer.
-   NEVER defer an entire overlap/dependency group — always release at least one member so the loop
-   makes progress. Put every deferred issue in "deferred" with its reason (logical/file-overlap/api-shape).
-6. Emit "batch" = the released issues as {number,title}, ordered by ascending number. An empty
-   batch is valid (everything open is blocked, deferred, or set aside) and ends the run.
+3. LEAF-ONLY. For each listed issue, fetch '.sub_issues_summary.total'. Keep only concrete,
+   buildable leaves. Put every umbrella/spec in "excluded" with a reason.
+4. Emit "candidates" = EVERY remaining open, labelled, buildable leaf after removing the
+   workflow-owned completed and set-aside numbers. Sort it by ascending number.
+5. Partition every candidate EXACTLY ONCE into "batch" or "deferred":
+   a. LOGICAL dependency:
+      - First discover relationship members:
+          gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by --jq '.[].number'
+      - Relationship membership does NOT prove a blocker is open. For every returned blocker not
+        in the completed list, fetch its current lifecycle state:
+          gh issue view <blocker-number> ${repoFlag} --json number,state --jq '{number,state}'
+      - Defer only for blockers whose freshly fetched state is OPEN. CLOSED blockers are satisfied.
+        Never infer openness merely because the dependency endpoint returned an issue number.
+      - Use kind="logical" and blockedBy=[verified open blocker numbers].
+   b. FILE OVERLAP: serialize candidates likely to edit the same files. Release one now; defer the
+      rest with kind="file-overlap" and blockedBy=[released candidate number(s)].
+   c. API SHAPE: release the producer; defer consumers with kind="api-shape" and
+      blockedBy=[producer candidate number(s)].
+   Every deferred item must include number, title, kind, non-empty blockedBy, and a precise reason.
+   Never defer an entire file-overlap/API-shape group: release at least one member so progress occurs.
+6. Emit "batch" in ascending issue-number order. batch + deferred must be an exact, disjoint
+   partition of candidates. An empty batch is only a proposed terminal observation; orchestration
+   will independently confirm it with another fresh pass.
+${mode === 'confirmation' ? `
+This is a CONFIRMATION pass because the prior result was terminal or invalid. Do not reuse its
+factual conclusions. Re-run all issue, leaf, relationship, and blocker-state queries from GitHub.
+` : ''}
 Return ONLY the structured object.
 `
 
@@ -243,21 +297,26 @@ NEVER fake a green suite. NEVER merge into anything but ${integ}.
 Return ONLY the structured object.
 `
 
-const finalizePrompt = (integ, baseBranch, done, unfinished) => `
+const finalizePrompt = (integ, baseBranch, done, unfinished, stoppedBy) => `
 You finalize an unattended implementation run. ${repoNote}
 
 Integration branch: ${integ}. Base branch: ${baseBranch}.
 Landed & closed: ${done.map(n => '#' + n).join(', ') || 'none'}.
-Left open (unfinished / set-aside): ${unfinished.map(u => `#${u.number} (${u.reason})`).join(', ') || 'none'}.
+Provisional unfinished: ${unfinished.map(u => `#${u.number} (${u.reason})`).join(', ') || 'none'}.
+Stopped by: ${stoppedBy}.
 
-1. Cleanup worktrees: \`git worktree prune\` and remove any leftover under ../wf-worktrees.
-2. ${PUSH
+1. Reconcile unfinished work before reporting:
+   - Freshly list open issues carrying "${LABEL}" and keep only concrete buildable leaves.
+   - Treat the workflow-owned completed list above as authoritative even if a GitHub read lags.
+   - Union those open buildable leaves with the provisional unfinished list, deduplicate by number,
+     and sort ascending. Preserve existing reasons; use "not reached (${stoppedBy})" for newly found
+     leaves. Do not include umbrella/spec issues. Return this complete list as "unfinished".
+2. Cleanup worktrees: \`git worktree prune\` and remove any leftover under ../wf-worktrees.
+3. ${PUSH
     ? `Push the integration branch: \`git push -u origin ${integ}\`. Then open a DRAFT PR into ${baseBranch}:
    \`gh pr create ${repoFlag} --draft --base ${baseBranch} --head ${integ} --title "Unattended implementation: ${done.length} issue(s)" --body "..."\`.
-   In the PR body summarise per-issue what shipped, and list every left-open/set-aside issue (with
-   its reason) for human attention. Also \`gh issue list ${repoFlag} --state open --label "${LABEL}"\`
-   and note any still-open buildable issue not already listed above as "not reached this run".
-   Report pushed=true and the PR url.`
+   In the PR body summarise per-issue what shipped and list every reconciled unfinished issue with
+   its reason for human attention. Report pushed=true and the PR url.`
     : `Do NOT push (offline mode). Leave the integration branch local. Report pushed=false.`}
 NEVER merge into ${baseBranch} — a human owns that final gate.
 Return ONLY the structured object.
@@ -277,10 +336,15 @@ log(`baseline green; integration branch = ${integ} (base ${baseBranch})`)
 const done = []                 // issue numbers landed on the integration branch and closed
 const attempts = new Map()      // issue number -> failure count (implement-fail or merge-rollback), persists across rounds
 const setAside = new Map()      // issue number -> reason (hit the attempt cap; excluded from later rounds)
+const knownCandidates = new Map() // issue number -> latest title/deferral evidence
 const bump = (n, why) => {
   const c = (attempts.get(n) ?? 0) + 1
   attempts.set(n, c)
   if (c >= MAX_ATTEMPTS && !setAside.has(n)) setAside.set(n, `${c} failed attempt(s): ${why}`)
+}
+const rememberPlan = (plan) => {
+  for (const t of plan.candidates) knownCandidates.set(t.number, { title: t.title })
+  for (const d of plan.deferred) knownCandidates.set(d.number, { title: d.title, reason: d.reason })
 }
 
 let round = 0
@@ -296,12 +360,34 @@ while (round < MAX_ROUNDS) {
 
   phase(pn)
   const setAsideList = [...setAside.keys()]
-  const plan = await agent(planPrompt(round, setAsideList), { ...M.plan, schema: PLAN_SCHEMA, phase: pn, label: `plan:r${round}` })
+  let plan = await agent(planPrompt(round, setAsideList, done), { ...M.plan, schema: PLAN_SCHEMA, phase: pn, label: `plan:r${round}` })
   if (!plan) { log(`round ${round}: planner failed — ending run for safety`); stop = 'plan-failed'; break }
-  if (!plan.batch.length) {
-    log(`round ${round}: empty batch (${plan.deferred.length} deferred, ${plan.excluded.length} excluded) — nothing left to release`)
-    stop = 'empty-batch'; break
+
+  let classification = classifyPlan(plan, done, setAsideList)
+  if (classification.kind !== 'ready') {
+    log(`round ${round}: ${classification.kind} plan — running independent confirmation`)
+    const confirmed = await agent(planPrompt(round, setAsideList, done, 'confirmation'), {
+      ...M.plan, schema: PLAN_SCHEMA, phase: pn, label: `confirm:r${round}`,
+    })
+    if (!confirmed) { log(`round ${round}: confirmation failed`); stop = 'plan-failed'; break }
+    plan = confirmed
+    classification = classifyPlan(plan, done, setAsideList)
   }
+
+  if (classification.kind === 'invalid') {
+    log(`round ${round}: confirmed invalid plan — ${classification.reason}`)
+    stop = 'plan-invalid'; break
+  }
+  rememberPlan(plan)
+  if (classification.kind === 'complete') {
+    log(`round ${round}: confirmed complete — no eligible open leaf issues`)
+    stop = 'complete'; break
+  }
+  if (classification.kind === 'blocked') {
+    log(`round ${round}: confirmed blocked — ${plan.deferred.length} issue(s) wait on verified-open logical blockers`)
+    stop = 'blocked'; break
+  }
+
   log(`round ${round}: releasing [${plan.batch.map(t => '#' + t.number).join(', ')}]` +
       `${plan.deferred.length ? `; deferred ${plan.deferred.map(d => '#' + d.number).join(', ')}` : ''}`)
 
@@ -338,25 +424,39 @@ while (round < MAX_ROUNDS) {
   }
 }
 
-// Everything touched but not landed: set-aside plus any still-open at run end.
-const unfinished = []
+// Everything observed but not landed, including candidates never attempted.
+const stoppedBy = stop ?? 'max-rounds'
+const unfinishedByNumber = new Map()
+for (const [n, info] of knownCandidates) {
+  if (!done.includes(n)) unfinishedByNumber.set(n, { number: n, reason: info.reason ?? `not reached (${stoppedBy})` })
+}
 for (const [n, c] of attempts) {
   if (done.includes(n)) continue
-  unfinished.push({ number: n, reason: setAside.get(n) ?? `attempted ${c}x, not landed (${stop ?? 'incomplete'})` })
+  unfinishedByNumber.set(n, {
+    number: n,
+    reason: setAside.get(n) ?? unfinishedByNumber.get(n)?.reason ?? `attempted ${c}x, not landed (${stoppedBy})`,
+  })
 }
+for (const [n, reason] of setAside) {
+  if (!done.includes(n)) unfinishedByNumber.set(n, { number: n, reason })
+}
+const unfinished = [...unfinishedByNumber.values()].sort((a, b) => a.number - b.number)
 
 phase('Finalize')
-const fin = await agent(finalizePrompt(integ, baseBranch, done, unfinished), { ...M.gate, schema: FINALIZE_SCHEMA, phase: 'Finalize', label: 'finalize' })
+const fin = await agent(finalizePrompt(integ, baseBranch, done, unfinished, stoppedBy), {
+  ...M.gate, schema: FINALIZE_SCHEMA, phase: 'Finalize', label: 'finalize',
+})
+const finalUnfinished = fin?.unfinished ?? unfinished
 
-log(`done: ${done.length} landed, ${unfinished.length} left open, ${round} round(s), stop=${stop ?? 'max-rounds'}`)
+log(`done: ${done.length} landed, ${finalUnfinished.length} left open, ${round} round(s), stop=${stoppedBy}`)
 return {
   integrationBranch: integ,
   baseBranch,
   completed: done,
-  unfinished,
+  unfinished: finalUnfinished,
   setAside: [...setAside.entries()].map(([number, reason]) => ({ number, reason })),
   rounds: round,
-  stoppedBy: stop ?? 'max-rounds',
+  stoppedBy,
   pr: fin?.prUrl ?? null,
   pushed: fin?.pushed ?? false,
 }

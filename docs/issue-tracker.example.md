@@ -11,9 +11,14 @@ current `origin`.
 - **Close**: `gh issue close <number> --comment "..."`
 
 ## Blocking
-Use GitHub native issue dependencies. A ticket is buildable only when every issue in its
-`blocked_by` set is CLOSED. Query with:
-`gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by`
+Use GitHub native issue dependencies. The `blocked_by` endpoint reports relationship members; it
+does not by itself prove that a blocker is still open. First discover blocker numbers:
+`gh api repos/<owner>/<name>/issues/<number>/dependencies/blocked_by --jq '.[].number'`
+
+Then fetch each returned issue's current lifecycle state:
+`gh issue view <blocker-number> --json number,state --jq '{number,state}'`
+
+A ticket is blocked only while at least one blocker is `OPEN`; `CLOSED` blockers are satisfied.
 
 ## Claim
 Before starting a ticket: `gh issue edit <number> --add-assignee @me`.

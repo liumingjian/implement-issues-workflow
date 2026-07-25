@@ -22,10 +22,13 @@ delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-m
      enough: an umbrella/spec is a *parent* issue (`sub_issues_summary.total > 0`), a buildable
      ticket is a *leaf* (`total == 0`). Specs are excluded. The planner then releases **only the
      currently-unblocked batch**, treating three things as blocking edges it re-judges live:
-     **logical** deps (`blocked_by`), **file overlap** (two issues likely editing the same files
-     are *serialized* across rounds instead of colliding at merge), and **API shape** (a consumer
-     waits for its producer). It never commits to a full DAG — a planning mistake only affects one
-     round, and the next re-plan self-corrects. An **empty batch ends the run.**
+     **logical** deps (`blocked_by` relationship members whose issue state is freshly verified as
+     `OPEN`), **file overlap** (two issues likely editing the same files are *serialized* across
+     rounds instead of colliding at merge), and **API shape** (a consumer waits for its producer).
+     A dependency relationship alone does not prove that its blocker is open, and issues completed
+     in the current run are authoritative even if GitHub reads lag. It never commits to a full DAG.
+     A terminal plan is independently confirmed: no candidates means **complete**; candidates all
+     waiting on verified-open logical blockers means **blocked**.
    - **Build (parallel)** — one agent per released issue in its **own git worktree** on a
      deterministic branch `wf/issue-{n}` (reused and accumulated across rounds, never rebuilt):
      claim → `/tdd` red-green → per-ticket full-suite gate → commit. Then, **only if commits
@@ -37,9 +40,10 @@ delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-m
      returns to a later round.
    - **Set-aside** — an issue that fails (build or merge) twice (**k=2**) is parked: excluded from
      later rounds, left **open** for the PR, its branch progress preserved.
-3. **Finalize** — push the integration branch and open a **draft PR** into your base branch,
-   summarising what landed and listing every set-aside / unfinished issue. **Never auto-merges**
-   — you own the final gate.
+3. **Finalize** — reconcile every still-open buildable leaf (including deferred or never-attempted
+   tickets), push the integration branch, and open a **draft PR** into your base branch, summarising
+   what landed and listing every set-aside / unfinished issue. **Never auto-merges** — you own the
+   final gate.
 
 ## Design decisions
 
@@ -109,9 +113,10 @@ Workflow({
 ```js
 { integrationBranch, baseBranch,
   completed: [numbers],                     // landed on the integration branch and closed
-  unfinished: [{number, reason}],           // left open (set-aside or not reached)
+  unfinished: [{number, reason}],           // all open buildable leaves: set-aside, deferred, failed, or not reached
   setAside: [{number, reason}],             // hit the attempt cap
-  rounds: number, stoppedBy: string,        // "empty-batch" | "max-rounds" | "budget" | ...
+  rounds: number, stoppedBy: string,        // "complete" | "blocked" | "max-rounds" | "budget" |
+                                             // "plan-failed" | "plan-invalid"
   pr: url|null, pushed: boolean }
 ```
 
