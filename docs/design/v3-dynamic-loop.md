@@ -132,5 +132,10 @@ reuse; per-phase model split (Opus planner, Sonnet worker); review-only-if-commi
 
 Docker sandbox / Effect / provider abstraction · a persisted DAG file (the original "compute
 once → file" proposal, retired by D2) · `/acceptance-gate` inside the loop (the per-merge full
-suite suffices; at most an optional pre-PR gate) · sandcastle's glossary / `.out-of-scope/`
+suite suffices; at most an optional pre-PR gate) · ~~sandcastle's glossary~~ / `.out-of-scope/`
 documentation discipline.
+
+> **Superseded (2026-08-04):** the glossary exclusion was wrong. "Closed" turned out to be carrying
+> two incompatible meanings — "this dependency is satisfied" and "this shipped" — which cost a full
+> design session to untangle. See [`CONTEXT.md`](../../CONTEXT.md) and
+> [v4-close-semantics.md](./v4-close-semantics.md).

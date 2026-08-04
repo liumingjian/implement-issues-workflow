@@ -250,8 +250,12 @@ Issue #${t.number} — "${t.title}". Integration branch: ${integ}. Branch: ${bra
 6. Commit to branch ${branchOf(t.number)} with a message referencing #${t.number}. Do NOT merge,
    do NOT push, do NOT CLOSE the issue — integration is a separate stage.
 
-If you cannot make the suite green or the spec is ambiguous, STOP: status "failed", leave the issue
-open, explain precisely. NEVER fake a green suite. Report committed=true only if work is on the branch.
+If you cannot make the suite green or the spec is ambiguous, STOP and leave the issue OPEN. Before
+returning, record the state on the tracker so the next person or round can pick it up:
+  gh issue comment ${t.number} ${repoFlag} --body "..."
+The comment must say why the attempt failed and exactly what already exists on ${branchOf(t.number)}
+(commits made, which tests pass and which fail). Then return status "failed".
+NEVER fake a green suite. Report committed=true only if work is on the branch.
 Return ONLY the structured object.
 `
 
@@ -270,6 +274,13 @@ depth — same discipline, minus the parallelism.
 
 Fix every real issue you find, re-run the FULL suite (it must STAY green), and commit the fixes to
 the same branch (${branchOf(t.number)}). Do NOT merge, push, or close.
+
+REVIEW IS A GATE. If you cannot complete the review, or you find something you cannot fix while
+keeping the full suite green, this branch WILL NOT BE MERGED — do not assume your work is about to
+land. Leave the issue OPEN and record the state on the tracker before returning:
+  gh issue comment ${t.number} ${repoFlag} --body "..."
+The comment must say what the review found or why it could not finish, and what exists on
+${branchOf(t.number)} right now. Then return status "failed".
 Return ONLY the structured object (changed=true only if you committed fixes).
 `
 
@@ -289,8 +300,14 @@ Issue #${t.number}. Source branch: ${branchOf(t.number)}. Integration branch: ${
      but broke behaviour — roll back THIS ONE merge: \`git merge --abort\` if mid-merge, else
      \`git reset --hard HEAD~1\`. Set result="failed", testsPassed=false, issueClosed=false, STOP.
      The issue stays OPEN for a later round; its branch progress is preserved.
-5. Clean merge AND green suite → the issue has truly landed. Post a resolution comment on
-   #${t.number} summarising what shipped, then \`gh issue close ${t.number} ${repoFlag} --comment "..."\`.
+5. Clean merge AND green suite → the issue has LANDED (landed means "on ${integ}", NOT "shipped" —
+   a human still owns the merge into the base branch). Close it with a comment whose FIRST LINE is
+   exactly:
+     Landed on \`${integ}\` as <merge-commit-sha>.
+   followed by a summary of what shipped. Use that body for the close:
+   \`gh issue close ${t.number} ${repoFlag} --comment "..."\`. The branch name in that first line is
+   what makes this run's closures findable later
+   (\`gh issue list --state closed --search "${integ}"\`) if the draft PR is ever abandoned.
    Set result="clean", testsPassed=true, issueClosed=true, and report the merge commit sha.
 
 NEVER fake a green suite. NEVER merge into anything but ${integ}.
@@ -316,7 +333,12 @@ Stopped by: ${stoppedBy}.
     ? `Push the integration branch: \`git push -u origin ${integ}\`. Then open a DRAFT PR into ${baseBranch}:
    \`gh pr create ${repoFlag} --draft --base ${baseBranch} --head ${integ} --title "Unattended implementation: ${done.length} issue(s)" --body "..."\`.
    In the PR body summarise per-issue what shipped and list every reconciled unfinished issue with
-   its reason for human attention. Report pushed=true and the PR url.`
+   its reason for human attention. The body MUST also carry this warning verbatim in substance:
+   this branch has to be merged — or explicitly discarded with its closed issues reopened
+   (\`gh issue list --state closed --search "${integ}"\`) — BEFORE the workflow is run again.
+   A re-run cuts a fresh integration branch off ${baseBranch} without these commits, and the issues
+   closed here are no longer eligible for release, so their work would silently go missing.
+   Report pushed=true and the PR url.`
     : `Do NOT push (offline mode). Leave the integration branch local. Report pushed=false.`}
 NEVER merge into ${baseBranch} — a human owns that final gate.
 Return ONLY the structured object.
@@ -411,7 +433,12 @@ while (round < MAX_ROUNDS) {
       log(`#${t.number} build failed (${attempts.get(t.number)}/${MAX_ATTEMPTS})${setAside.has(t.number) ? ' — set aside' : ''}`)
       continue
     }
-    if (b.reviewOk === false) log(`#${t.number} review incomplete — merging the gated build anyway`)
+    // Review is a gate, not advice (ADR 0002): an unreviewed build never lands.
+    if (!b.reviewOk) {
+      bump(t.number, 'review did not pass')
+      log(`#${t.number} review failed — not merging (${attempts.get(t.number)}/${MAX_ATTEMPTS})${setAside.has(t.number) ? ' — set aside' : ''}`)
+      continue
+    }
 
     const merge = await agent(mergePrompt(t, integ), { ...M.merge, schema: MERGE_SCHEMA, phase: pn, label: `merge:#${t.number}` })
     if (merge && merge.result === 'clean' && merge.testsPassed && merge.issueClosed) {
