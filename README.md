@@ -33,11 +33,13 @@ delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-m
      deterministic branch `wf/issue-{n}` (reused and accumulated across rounds, never rebuilt):
      claim → `/tdd` red-green → per-ticket full-suite gate → commit. Then, **only if commits
      landed**, a separate reviewer agent runs `/code-review` (Standards + Spec) and commits fixes.
-   - **Merge (serial)** — merge each built branch into the integration branch one at a time; a
-     conflict is **resolved in place** via `/resolving-merge-conflicts` (read both sides, never
-     rebuild). The **full suite runs after every merge** — this per-merge gate *is* the barrier.
-     Green + clean → the issue is **closed**. Red → that one merge is **rolled back** and the issue
-     returns to a later round.
+     **The review is a gate**: if it doesn't pass, the branch is not merged and the issue returns to
+     a later round — a green suite alone is not enough to land.
+   - **Merge (serial)** — merge each built-and-reviewed branch into the integration branch one at a
+     time; a conflict is **resolved in place** via `/resolving-merge-conflicts` (read both sides,
+     never rebuild). The **full suite runs after every merge** — this per-merge gate *is* the
+     barrier. Green + clean → the issue is **closed**, with a comment naming the integration branch
+     and merge sha. Red → that one merge is **rolled back** and the issue returns to a later round.
    - **Set-aside** — an issue that fails (build or merge) twice (**k=2**) is parked: excluded from
      later rounds, left **open** for the PR, its branch progress preserved.
 3. **Finalize** — reconcile every still-open buildable leaf (including deferred or never-attempted
@@ -57,15 +59,23 @@ delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-m
   preflight & gates Haiku/low (mechanical).
 - **Robustness over speed/cost** — worktree isolation (each may install its own deps) and a full
   test run at every gate. It deliberately spends more to stay correct.
-- **Test gate is absolute** — nothing advances on a red suite: baseline, per-ticket, and every
-  post-merge run.
+- **Gates are absolute** — nothing advances on a red suite (baseline, per-ticket, every post-merge
+  run), and nothing merges without a passing review. Skipping review on a green build would let a
+  wrong-but-tested interface become the foundation the next round's consumers are written against
+  ([ADR 0002](docs/adr/0002-review-failure-blocks-merge.md)).
+- **`closed` means landed, not shipped** — an issue is closed the moment it lands on the integration
+  branch, because issue state is the planner's only dependency signal. Quality and progress
+  information travels as comments, never as issue state
+  ([ADR 0001](docs/adr/0001-closed-means-landed-on-integration.md), [`CONTEXT.md`](CONTEXT.md)).
 - **Spec vs ticket by structure, not labels** — so it needs no new labelling discipline and no
   changes to the Matt-Pocock skills.
 
 ## Safety
 
-- Never fakes a green suite or a passing review; a stuck issue is left **open** with an
-  explanation after two attempts, and the run keeps going on the rest of the backlog.
+- Never fakes a green suite or a passing review; a stuck issue is left **open**, with the failing
+  agent commenting on the issue itself (why it failed, what already exists on `wf/issue-N`), and the
+  run keeps going on the rest of the backlog. A build whose review fails is discarded rather than
+  merged, even though its suite is green.
 - Aborts before writing any code if the **baseline is red**. A merge that breaks the suite is
   **rolled back** — a red suite never lands.
 - **Subagents write to your tracker** (assign, comment, close issues; push a branch; open a PR).
@@ -82,6 +92,11 @@ delegates each stage to an existing skill (`/tdd`, `/code-review`, `/resolving-m
   - dependencies use **GitHub native issue dependencies** (`blocked_by`),
   - specs are **parent issues** with their tickets attached as **sub-issues**.
 - A project with a runnable test command (the agents detect it).
+- **Before re-running: merge or discard the previous run's draft PR.** Each run cuts a fresh
+  integration branch off the base, and the planner only releases *open* issues — so if a previous
+  run's branch is still unmerged, the work behind its already-closed issues is neither in the new
+  branch nor eligible to be rebuilt. To discard instead, reopen its issues first:
+  `gh issue list --state closed --search "auto/implement"`.
 
 ## Install
 
